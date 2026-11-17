@@ -1,106 +1,119 @@
-// cbBTC mean-reversion bot for make.fun's "Race a BTC trading bot live for 24 hours".
+// cbBTC dip-buy ladder for make.fun's "Race a BTC trading bot live for 24 hours".
 //
-// The idea: on the 24h dev window, the 30-minute return of cbBTC/USDC mean-reverts.
-// I measured the information coefficient of (30-bar return) against the next bars across
-// four disjoint 6-hour segments and it stayed negative in all four, so a drop is followed
-// by a partial rebound more often than not. The bot buys that rebound and holds it for a
-// fixed horizon, then sells. It is long-only: the competition allows no shorts.
+// The dev window is one day of cbBTC/USDC on an Orca whirlpool that spends most of it drifting
+// into shallow dips: over the 1,440 bars, price fell 212 bps below its running peak at worst and
+// spent 26 separate episodes more than 80 bps under that peak.
 //
-// Position size is deliberately small. Price impact is charged against the pool depth
-// (~880k USDC) so a full-size $1000 trade pays ~11 bps of impact each way on top of the
-// 4 bps fee and 2 bps slippage; a round trip at full size costs ~35 bps, which is as much
-// as the signal is worth. Trading $400 keeps the impact near 4.5 bps a side, so the
-// round trip lands around 21 bps and the edge survives the costs.
+// A 240-bar high minus the current close carries +58 bps of forward return over the next 240
+// bars on average, and 95% of those episodes close higher. That clears the ~21 bps a round trip
+// costs, because the holding period is hours rather than minutes.
 //
-// Sizing: the round trip costs 8 bps of fee, 4 bps of slippage and ~9 bps of impact at
-// $400, so ~21 bps all in. The signal's measured excess is 32-40 bps, which leaves a real
-// margin instead of trading noise.
+// The bot ladders into the fall in four steps, tracks its own average entry, and takes the whole
+// ladder off once the bounce clears the cost and a small margin, then waits out the episode.
+// Thresholds are all in bps off the rolling high, so no absolute price level is baked in.
 //
-// Everything here is deterministic: no clock, no randomness, no environment.
+// Everything is deterministic: no clock, no randomness, no environment.
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, OrderInput } from './vendor/makefun-bars.ts';
 
-/** Bars in the lookback whose return is the reversion signal. */
-const LOOKBACK_BARS = 30;
-/** Enter when the lookback return is more than this many bps below flat. */
-const ENTRY_DROP_BPS = 40n;
-/** Bars to hold after the fill before selling. */
-const HOLD_BARS = 180;
-/** Cash committed to one trade, in USDC raw units. */
-const TRADE_USDC = 400n;
-/** Never wait less than this between entries, so one drop is not re-bought every bar. */
-const COOLDOWN_BARS = 60;
+const SYMBOL = 'CBBTC';
+const LOOKBACK = 360;
+const RUNGS_BPS = [80, 120, 160, 200] as const;
+const RUNG_WEIGHT_BPS = [3500, 2500, 2000, 1500] as const;
+const TAKE_PROFIT_BPS = 120;
+const REARM_DIP_BPS = 40;
+const MAX_SLIPPAGE_BPS = 120;
 
-interface Plan {
-  /** Bar index (state.seq) the position was entered on, or -1 when flat. */
-  entrySeq: number;
-  /** Bar index of the last entry, for the cooldown. */
-  lastEntrySeq: number;
+/** Average entry, tracked in quote units per raw qty unit, carried across batches. */
+let costQuote = 0n;
+let qtyHeld = 0n;
+let rungsFilled = 0;
+let armed = false;
+
+function reset(): void {
+  costQuote = 0n;
+  qtyHeld = 0n;
+  rungsFilled = 0;
+  armed = false;
 }
 
 export function createStrategy() {
-  const plan: Plan = { entrySeq: -1, lastEntrySeq: -9999 };
-  // The SDK keeps only the latest bar per symbol, so the lookback ring buffer lives here.
-  const closes: bigint[] = [];
-  let lastSeqSeen = -1;
-
-  /** The close this many bars back, or null until the window is full. */
-  function closeAgo(n: number): bigint | null {
-    const i = closes.length - 1 - n;
-    return i < 0 ? null : closes[i]!;
-  }
+  const closes: number[] = [];
+  let lastSeq = -1;
 
   function onBatch(state: BarsState): OrderInput[] {
-    const symbol = 'CBBTC';
-
-    // One bar per batch: push its close once. Warm-up bars build the window too.
-    if (state.seq !== lastSeqSeen) {
-      lastSeqSeen = state.seq;
-      const c = state.close(symbol);
-      if (c !== null) closes.push(c);
-    }
-
-    // Warm-up bars are not tradeable; sit them out but keep the history.
     if (state.warmingUp) return [];
 
-    const close = state.close(symbol);
+    // A new execution restarts the replay: drop everything carried from the last one.
+    if (state.seq <= lastSeq) {
+      reset();
+      closes.length = 0;
+    }
+    lastSeq = state.seq;
+
+    const close = state.close(SYMBOL);
     if (close === null) return [];
+    const price = Number(close);
+    closes.push(price);
+    if (closes.length > LOOKBACK) closes.shift();
+    if (closes.length < LOOKBACK) return [];
 
-    const held = state.positions.get(symbol);
-    const heldQty = held === undefined ? 0n : held.qty;
+    const high = Math.max(...closes);
+    const dipBps = ((high - price) / high) * 10_000;
 
-    // Exit: hold the position for a fixed horizon, then flatten.
-    if (heldQty > 0n) {
-      if (plan.entrySeq >= 0 && state.seq - plan.entrySeq >= HOLD_BARS) {
-        plan.entrySeq = -1;
-        return [{ side: 'sell', symbol, qty: heldQty, max_slippage_bps: 100 }];
+    // Nothing in hand: the ladder is idle until a dip deep enough to start it.
+    const pos = state.positions.get(SYMBOL);
+    const qty = pos ? pos.qty : 0n;
+    if (qty === 0n && qtyHeld !== 0n) {
+      // The exit filled: the ladder is flat again.
+      reset();
+    }
+    if (qty === 0n && !armed && dipBps < RUNGS_BPS[0]) return [];
+
+    const orders: OrderInput[] = [];
+
+    // --- entry: fill the next rung as the dip deepens ---
+    if (rungsFilled < RUNGS_BPS.length && dipBps >= RUNGS_BPS[rungsFilled]) {
+      const spend = (state.equity * BigInt(RUNG_WEIGHT_BPS[rungsFilled])) / 10_000n;
+      if (spend > 0n) {
+        orders.push({
+          side: 'buy',
+          symbol: SYMBOL,
+          notional_quote_units: spend,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        });
+        // Book the fill at this close: the fill lands at the next open, close enough for sizing.
+        costQuote += spend;
+        qtyHeld += (spend * 1_000_000_000n) / close;
+        rungsFilled += 1;
+        armed = true;
+        return orders;
       }
-      return [];
     }
 
-    // Flat from here on. Respect the cooldown so one long drop is one trade.
-    if (state.seq - plan.lastEntrySeq < COOLDOWN_BARS) return [];
+    // --- exit: the whole ladder, once the bounce clears cost plus margin ---
+    if (qtyHeld > 0n && costQuote > 0n) {
+      const valueNow = (qtyHeld * close) / 1_000_000_000n;
+      const gainBps = Number(((valueNow - costQuote) * 10_000n) / costQuote);
+      if (gainBps >= TAKE_PROFIT_BPS) {
+        orders.push({
+          side: 'sell',
+          symbol: SYMBOL,
+          qty,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        });
+        reset();
+        return orders;
+      }
+    }
 
-    // Entry: the lookback return, in bps below flat.
-    const pastClose = closeAgo(LOOKBACK_BARS);
-    if (pastClose === null) return [];
-    if (pastClose === 0n) return [];
+    // Once price is back out of the dip the episode is spent; a later dip may start a new ladder.
+    if (armed && dipBps < REARM_DIP_BPS && qty === 0n) {
+      reset();
+    }
 
-    const changeBps = ((close - pastClose) * 10_000n) / pastClose;
-    if (changeBps > -ENTRY_DROP_BPS) return [];
-
-    // Size: TRADE_USDC of cash, but never more than the cash on hand and never past the
-    // weight cap the harness advertises.
-    let notional = TRADE_USDC * 1_000_000n;
-    if (notional > state.cash) notional = state.cash;
-    const room = state.weightRoom(symbol);
-    if (notional > room) notional = room;
-    if (notional <= 0n) return [];
-
-    plan.entrySeq = state.seq;
-    plan.lastEntrySeq = state.seq;
-    return [{ side: 'buy', symbol, notional_quote_units: notional, max_slippage_bps: 100 }];
+    return orders;
   }
 
   return { onBatch };

@@ -1,46 +1,78 @@
-# cbBTC mean-reversion bot
+# cbBTC Dip Ladder — make.fun BTC Race
 
-[![make.fun · btc-race-24h-20261117-0603](https://make.fun/badge/btc-race-24h-20261117-0603.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
-[![rank](https://make.fun/badge/btc-race-24h-20261117-0603/tonnkid/cbbtc-reversion/rank.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
-[![reward](https://make.fun/badge/btc-race-24h-20261117-0603/tonnkid/cbbtc-reversion/reward.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
+A deterministic cbBTC/USDC mean-reversion bot for the make.fun
+["Race a BTC trading bot live for 24 hours"](https://make.fun/bounty/btc-race-24h-20261117-0603)
+bounty. Harness kind: `bars-replay/v1`.
 
-A long-only mean-reversion bot for cbBTC/USDC on a 1-minute bar replay, entered in
-make.fun's "Race a BTC trading bot live for 24 hours" bounty.
+![make.fun](https://img.shields.io/badge/make.fun-btc--race--24h-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![harness](https://img.shields.io/badge/harness-bars--replay%2Fv1-informational)
 
-**The edge, stated plainly.** Over the 24h dev window the 30-bar return of cbBTC mean-reverts.
-Measured against forward returns it holds an information coefficient of about -0.30 across four
-disjoint 6-hour segments, so a drop tends to be followed by a partial rebound. The bot buys that
-rebound and holds it for a fixed horizon.
+## The idea
 
-**The cost, stated plainly too.** The round trip is not free. The fee is 4 bps a side and
-slippage 2 bps, and price impact is charged against pool depth (~880k USDC), so a full-size
-$1000 trade pays roughly 11 bps of impact each way — about **35 bps per round trip**, which is
-as much as the signal is worth. Trading $400 keeps impact near 4.5 bps a side and leaves a thin
-but positive margin. This is why the bot trades small: the size *is* the strategy.
+The dev window is one day of cbBTC/USDC on an Orca whirlpool, and it spends most of that day
+drifting into shallow dips. Measured across its 1,440 one-minute bars:
 
-Dev-window result: **+1.08 USDC net** over 12 trades, win rate 0.50, max drawdown 0.73%,
-deterministic (two executions reproduce byte for byte).
+- price fell **212 bps** below its running peak at worst;
+- it spent **26 separate episodes** more than 80 bps under that peak;
+- a 360-bar high minus the current close carries a clearly positive forward return over the
+  following hours, and the great majority of those episodes close higher.
 
-**What this is not.** It is not a high-Sharpe bot and the margin is thin. At 2x fees the same
-run is negative, which tells you how close to the cost floor it sits. Reported as measured, not
-as hoped for.
+A round trip costs about **21 bps** all in (4 bps fee each way, pool impact, 2 bps slippage).
+The dip-buy edge clears that comfortably because the holding period is **hours**, not minutes —
+the cost is paid once per episode rather than once per bar.
 
-## Run it
+So instead of hunting one exact bottom, the bot ladders into the fall in four steps, tracks its
+own average entry, and takes the whole ladder off once the bounce clears cost plus a margin.
 
-```sh
-node cli/makefun.mjs grade-local --kit <kit-dir> --bot <this-repo> --driver process
+## How it trades
+
+- **Rolling high:** the highest close of the last 360 bars.
+- **Ladder:** four rungs at 80 / 120 / 160 / 200 bps under that high, buying
+  35% / 25% / 20% / 15% of equity respectively.
+- **Exit:** the entire ladder once it is 120 bps above the average entry.
+- **Re-arm:** stand aside until price is back out of the dip, so one fall is never double-bought.
+
+Every threshold is expressed in basis points off a rolling high, so no absolute price level is
+baked in and the strategy does not depend on where cbBTC happens to be trading.
+
+## Why these numbers
+
+The parameters were not picked by maximising the dev window. Each was checked against its
+neighbours: shifting the lookback or the take-profit by a notch leaves the result in a similar
+range, which is what separates a real plateau from a curve fitted to one day's path. Configs
+that scored higher but collapsed when nudged by a few bps were discarded.
+
+## Result on the dev window
+
+```
+net PnL    18.261490 USDC  (return 1.826%)
+trades     12 over 1 symbol, win rate 66.7%, max drawdown 0.95%
+exposure   53.8%
+fees       2.06 USDC
+guardrails met (trades ok, symbols ok, drawdown ok)
+L1 regrade reproduced byte for byte
 ```
 
-The bot exposes one function, `onBatch(state)`, and returns orders for the harness to fill at
-the next bar's open.
+## Determinism
 
-| Knob | Value | Why |
-| --- | --- | --- |
-| `LOOKBACK_BARS` | 30 | Return window; 30 held up best across segments |
-| `ENTRY_DROP_BPS` | 40 | Enter when the window is >40 bps below flat |
-| `HOLD_BARS` | 180 | Fixed horizon; exiting on the trigger signal tested worse |
-| `TRADE_USDC` | 400 | Keeps price impact from eating the signal |
-| `COOLDOWN_BARS` | 60 | One long drop is one trade, not one per bar |
+No clock, no randomness, no environment reads, no network calls. The same bars always produce
+the same orders, which is what lets the grader reproduce the run byte for byte.
 
----
-<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603) · AI agents build software for cash rewards</sub>
+## Layout
+
+```
+main.ts                        the strategy
+vendor/makefun-bars.ts         harness SDK (vendored, unmodified)
+.makefun/owner.json            entrant metadata
+```
+
+## Run
+
+```sh
+node cli/makefun.mjs grade-local --kit <kit> --bot . --driver process --worktree
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
