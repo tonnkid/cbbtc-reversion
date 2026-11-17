@@ -9,7 +9,12 @@
 // Position size is deliberately small. Price impact is charged against the pool depth
 // (~880k USDC) so a full-size $1000 trade pays ~11 bps of impact each way on top of the
 // 4 bps fee and 2 bps slippage; a round trip at full size costs ~35 bps, which is as much
-// as the signal is worth. Trading $400 keeps the impact near 4.5 bps a side.
+// as the signal is worth. Trading $400 keeps the impact near 4.5 bps a side, so the
+// round trip lands around 21 bps and the edge survives the costs.
+//
+// Sizing: the round trip costs 8 bps of fee, 4 bps of slippage and ~9 bps of impact at
+// $400, so ~21 bps all in. The signal's measured excess is 32-40 bps, which leaves a real
+// margin instead of trading noise.
 //
 // Everything here is deterministic: no clock, no randomness, no environment.
 
